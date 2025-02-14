@@ -12,6 +12,8 @@ lazy_static::lazy_static! {
         .expect("ALLORA_API_KEY must be set");
 }
 
+const API_INTERVAL: u64 = 1000;
+
 
 const MAX_CONNECTIONS: usize = 500;
 const API_URLS: &[(&str, &str, &str)] = &[
@@ -64,7 +66,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 tx.send(serde_json::to_string(&msg).expect("Error serializing data")).expect("Failed to send message");
             }
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(API_INTERVAL)).await;
         }
     });
 
