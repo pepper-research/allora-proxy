@@ -5,7 +5,8 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::accept_async;
 use tokio::sync::broadcast;
 use tokio_tungstenite::tungstenite::Utf8Bytes;
-
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 lazy_static::lazy_static! {
     static ref ALLORA_API_KEY: String = std::env::var("ALLORA_API_KEY")
@@ -13,8 +14,6 @@ lazy_static::lazy_static! {
 }
 
 const API_INTERVAL: u64 = 1000;
-
-
 const MAX_CONNECTIONS: usize = 500;
 const API_URLS: &[(&str, &str, &str)] = &[
     ("ETH", "5m", "https://api.upshot.xyz/v2/allora/consumer/price/ethereum-11155111/ETH/5m"),
@@ -30,7 +29,6 @@ struct AlloraMessage {
     data: Value
 }
 
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     run_server().await
@@ -43,62 +41,123 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let (tx, _) = broadcast::channel::<String>(16);
     let tx_clone = tx.clone();
 
+    // Track number of active subscribers
+    let subscriber_count = Arc::new(AtomicUsize::new(0));
+    let subscriber_count_api = subscriber_count.clone();
 
     let api_interval_handler = tokio::spawn(async move {
         let client = reqwest::Client::new();
-        // send reqwest with application/json and api key
-        // curl -X 'GET' --url 'https://api.upshot.xyz/v2/allora/consumer/price/ethereum-11155111/ETH/5m' -H 'accept: application/json' -H 'x-api-key: {API_KEY}'
+
         loop {
-            for (symbol, interval, url) in API_URLS {
-                let response = client.get(url.to_string())
-                    .header("accept", "application/json")
-                    .header("x-api-key", ALLORA_API_KEY.to_string())
-                    .send()
-                    .await
-                    .expect("Failed to send request");
+            // Only make API calls if there are active subscribers
+            if subscriber_count_api.load(Ordering::Relaxed) > 0 {
+                for (symbol, interval, url) in API_URLS {
+                    match async {
+                        let response = client.get(url.to_string())
+                            .header("accept", "application/json")
+                            .header("x-api-key", ALLORA_API_KEY.to_string())
+                            .send()
+                            .await?;
 
-                let body = response.json().await.expect("Failed to parse response");
+                        let body = response.json().await?;
 
-                let msg = AlloraMessage {
-                    product: symbol.to_string(),
-                    interval: interval.to_string(),
-                    data: body
-                };
-                tx.send(serde_json::to_string(&msg).expect("Error serializing data")).expect("Failed to send message");
+                        let msg = AlloraMessage {
+                            product: symbol.to_string(),
+                            interval: interval.to_string(),
+                            data: body
+                        };
+
+                        Ok::<_, Box<dyn std::error::Error>>(serde_json::to_string(&msg)?)
+                    }.await {
+                        Ok(message) => {
+                            // Only send if we still have subscribers
+                            if subscriber_count_api.load(Ordering::Relaxed) > 0 {
+                                // Ignore send errors - this means no active subscribers
+                                let _ = tx.send(message);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Error fetching/processing API data: {}", e);
+                            // Implement exponential backoff or other error handling as needed
+                        }
+                    }
+                }
             }
+
             tokio::time::sleep(tokio::time::Duration::from_millis(API_INTERVAL)).await;
         }
     });
 
-
     while let Ok((stream, addr)) = listener.accept().await {
+        // Check connection limit
+        if subscriber_count.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
+            println!("Connection limit reached, rejecting client: {:?}", addr);
+            continue;
+        }
+
         println!("New client: {:?}", addr);
         let mut rx = tx_clone.subscribe();
+        let subscriber_count = subscriber_count.clone();
+
+        // Increment subscriber count
+        subscriber_count.fetch_add(1, Ordering::Relaxed);
 
         tokio::spawn(async move {
             let ws_stream = match accept_async(stream).await {
                 Ok(ws_stream) => ws_stream,
                 Err(e) => {
                     println!("Error during WebSocket handshake: {}", e);
+                    subscriber_count.fetch_sub(1, Ordering::Relaxed);
                     return;
                 }
             };
 
-            let (mut write, _) = ws_stream.split();
+            let (mut write, read) = ws_stream.split();
 
+            // Handle client disconnection
+            let mut read = read.fuse();
 
-            while let Ok(message) = rx.recv().await {
-                write.send(tokio_tungstenite::tungstenite::Message::Text(Utf8Bytes::from(message))).await.expect("Failed to send message");
+            loop {
+                tokio::select! {
+                    message = rx.recv() => {
+                        match message {
+                            Ok(msg) => {
+                                if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Text(Utf8Bytes::from(msg))).await {
+                                    println!("Error sending message to client: {}", e);
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                println!("Error receiving broadcast message: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                    // Handle client messages or disconnection
+                    msg = read.next() => {
+                        match msg {
+                            Some(Ok(_)) => (), // Handle client messages if needed
+                            Some(Err(e)) => {
+                                println!("Error in client connection: {}", e);
+                                break;
+                            }
+                            None => {
+                                println!("Client disconnected");
+                                break;
+                            }
+                        }
+                    }
+                }
             }
 
-
+            // Decrement subscriber count on disconnect
+            subscriber_count.fetch_sub(1, Ordering::Relaxed);
         });
     }
 
-    api_interval_handler.await.expect("API interval handler failed");
+    api_interval_handler.await?;
     Ok(())
 }
-
 
 
 #[cfg(test)]
